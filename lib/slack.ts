@@ -1,7 +1,5 @@
-/**
- * Slack Incoming Webhook — fires when Marcus approves a proposal.
- * Why webhook (not Bot API): one URL, zero OAuth, enough for the approval loop.
- */
+import { formatUsd } from "@/lib/money";
+
 export async function notifyProposalApproved(params: {
   customerName: string;
   total: number;
@@ -11,16 +9,11 @@ export async function notifyProposalApproved(params: {
     throw new Error("SLACK_WEBHOOK_URL is not configured");
   }
 
-  const totalFormatted = params.total.toLocaleString("en-US", {
-    style: "currency",
-    currency: "USD",
-  });
-
   const response = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      text: `New proposal approved for ${params.customerName}, total ${totalFormatted}`,
+      text: `New proposal approved for ${params.customerName}, total ${formatUsd(params.total)}`,
     }),
   });
 

@@ -1,17 +1,12 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { formatPricingCatalog, PRICING_TABLE } from "@/lib/pricing";
+import { roundMoney } from "@/lib/money";
+import { isFiniteNumber, type LineItem } from "@/lib/types";
+
 export const PROPOSAL_MODEL = "claude-sonnet-4-6";
 
 const INPUT_USD_PER_MTOK = 3;
 const OUTPUT_USD_PER_MTOK = 15;
-
-export type LineItem = {
-  sku?: string;
-  description: string;
-  quantity: number;
-  unit_price: number;
-  line_total: number;
-};
 
 export type ProposalDraft = {
   line_items: LineItem[];
@@ -78,12 +73,7 @@ JSON SHAPE (exact keys):
 function extractJsonText(raw: string): string {
   const trimmed = raw.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) return fenced[1].trim();
-  return trimmed;
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
+  return fenced?.[1]?.trim() ?? trimmed;
 }
 
 export function validateProposalDraft(data: unknown): ProposalDraft | null {
@@ -92,9 +82,7 @@ export function validateProposalDraft(data: unknown): ProposalDraft | null {
   const obj = data as Record<string, unknown>;
   if (!Array.isArray(obj.line_items) || obj.line_items.length === 0) return null;
   if (!isFiniteNumber(obj.subtotal) || !isFiniteNumber(obj.total)) return null;
-  if (typeof obj.summary !== "string" || obj.summary.trim().length === 0) {
-    return null;
-  }
+  if (typeof obj.summary !== "string" || !obj.summary.trim()) return null;
   if (obj.total <= 0) return null;
 
   const line_items: LineItem[] = [];
@@ -130,7 +118,6 @@ export function validateProposalDraft(data: unknown): ProposalDraft | null {
   };
 }
 
-
 export function applyCatalogPrices(draft: ProposalDraft): ProposalDraft {
   const line_items = draft.line_items.map((item) => {
     const match =
@@ -142,20 +129,20 @@ export function applyCatalogPrices(draft: ProposalDraft): ProposalDraft {
           item.description.toLowerCase().includes(p.description.toLowerCase()) ||
           p.description.toLowerCase().includes(item.description.toLowerCase()),
       );
-    const unit_price = match ? match.unit_price : item.unit_price;
-    const line_total = Math.round(item.quantity * unit_price * 100) / 100;
+
+    const unit_price = match?.unit_price ?? item.unit_price;
     return {
       ...item,
       sku: match?.sku ?? item.sku,
       unit_price,
-      line_total,
+      line_total: roundMoney(item.quantity * unit_price),
       description: item.description || match?.description || "Line item",
     };
   });
 
-  const subtotal =
-    Math.round(line_items.reduce((sum, i) => sum + i.line_total, 0) * 100) /
-    100;
+  const subtotal = roundMoney(
+    line_items.reduce((sum, i) => sum + i.line_total, 0),
+  );
 
   return {
     line_items,
@@ -173,12 +160,7 @@ async function callClaudeOnce(
     model: PROPOSAL_MODEL,
     max_tokens: 4096,
     system: buildSystemPrompt(),
-    messages: [
-      {
-        role: "user",
-        content: `Site-walk notes:\n\n${rawNotes}`,
-      },
-    ],
+    messages: [{ role: "user", content: `Site-walk notes:\n\n${rawNotes}` }],
   });
 
   const textBlock = response.content.find((block) => block.type === "text");
@@ -194,29 +176,23 @@ async function callClaudeOnce(
 }
 
 function parseAndValidate(text: string): ProposalDraft | null {
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(extractJsonText(text));
+    const validated = validateProposalDraft(JSON.parse(extractJsonText(text)));
+    if (!validated) return null;
+    const priced = applyCatalogPrices(validated);
+    return priced.total > 0 ? priced : null;
   } catch {
     return null;
   }
-  const validated = validateProposalDraft(parsed);
-  if (!validated) return null;
-  const priced = applyCatalogPrices(validated);
-  if (priced.total <= 0) return null;
-  return priced;
 }
 
 export async function generateProposalFromNotes(
   rawNotes: string,
 ): Promise<GenerateResult> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY is not configured");
-  }
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not configured");
 
   const client = new Anthropic({ apiKey });
-
   let input_tokens = 0;
   let output_tokens = 0;
   let lastError = "Invalid JSON or zero total from Claude";
@@ -237,6 +213,7 @@ export async function generateProposalFromNotes(
           output_tokens,
         };
       }
+
       lastError =
         attempt === 1
           ? "Claude returned invalid JSON or a zero total; retrying once"

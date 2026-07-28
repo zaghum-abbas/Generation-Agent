@@ -1,20 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { AddLeadModal, type NewLeadForm } from "@/components/add-lead-modal";
 import { Button } from "@/components/ui/button";
+import { apiFetch, apiFetchOk } from "@/lib/client-api";
+import { readErrorMessage } from "@/lib/errors";
+import { formatUsd, recomputeLineItems, roundMoney } from "@/lib/money";
 import { cn } from "@/lib/utils";
 import type { Lead, LeadListItem, LineItem, Proposal } from "@/lib/types";
 
-function formatMoney(value: number | string | null | undefined): string {
-  const n = typeof value === "number" ? value : Number(value ?? 0);
-  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
-}
-
-function StatusBadge({
-  status,
-}: {
-  status: string | null | undefined;
-}) {
+function StatusBadge({ status }: { status: string | null | undefined }) {
   const label = status ?? "no proposal";
   const styles =
     label === "approved" || label === "sent"
@@ -35,17 +30,45 @@ function StatusBadge({
   );
 }
 
-function recalcItems(items: LineItem[]): {
-  items: LineItem[];
-  subtotal: number;
-} {
-  const next = items.map((item) => ({
-    ...item,
-    line_total: Math.round(item.quantity * item.unit_price * 100) / 100,
-  }));
-  const subtotal =
-    Math.round(next.reduce((sum, i) => sum + i.line_total, 0) * 100) / 100;
-  return { items: next, subtotal };
+function applyProposal(p: Proposal | null | undefined) {
+  if (!p) {
+    return { proposal: null, items: [] as LineItem[], summary: "" };
+  }
+
+  let items: LineItem[] = [];
+  if (Array.isArray(p.line_items)) {
+    items = p.line_items;
+  } else if (typeof p.line_items === "string") {
+    try {
+      const parsed: unknown = JSON.parse(p.line_items);
+      if (Array.isArray(parsed)) items = parsed as LineItem[];
+    } catch {
+      items = [];
+    }
+  }
+
+  return {
+    proposal: { ...p, line_items: items },
+    items,
+    summary: p.ai_summary ?? "",
+  };
+}
+
+async function fetchLeadsList(): Promise<LeadListItem[]> {
+  let lastError = "Failed to load leads";
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const { res, data } = await apiFetch<{
+      leads?: LeadListItem[];
+      error?: string;
+      detail?: string;
+    }>("/api/leads");
+    if (res.ok) return data.leads ?? [];
+    lastError = readErrorMessage(data, lastError);
+    if (attempt === 1) await new Promise((r) => setTimeout(r, 400));
+  }
+
+  throw new Error(lastError);
 }
 
 export function Dashboard() {
@@ -60,127 +83,183 @@ export function Dashboard() {
   const [generating, setGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
   const [approving, setApproving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [addLeadOpen, setAddLeadOpen] = useState(false);
+  const [creatingLead, setCreatingLead] = useState(false);
 
-  const runningTotal = useMemo(
-    () => recalcItems(editItems).subtotal,
-    [editItems],
-  );
+  const runningTotal = recomputeLineItems(editItems).subtotal;
+  const canEdit = proposal?.status === "draft";
+  const busy = generating || saving || approving || creatingLead;
 
-  const loadLeads = useCallback(async () => {
+
+  const loadLeads = useCallback(async (preferSelectId?: string) => {
     setListLoading(true);
-    setError(null);
     try {
-      const res = await fetch("/api/leads");
-      const data = (await res.json()) as {
-        leads?: LeadListItem[];
-        error?: string;
-      };
-      if (!res.ok) throw new Error(data.error ?? "Failed to load leads");
-      const next = data.leads ?? [];
+      const next = await fetchLeadsList();
       setLeads(next);
-      if (!selectedId && next.length > 0) {
-        setSelectedId(next[0].id);
-      }
+      if (preferSelectId) setSelectedId(preferSelectId);
+      else setSelectedId((current) => current ?? next[0]?.id ?? null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load leads");
     } finally {
       setListLoading(false);
-    }
-  }, [selectedId]);
-
-  const loadDetail = useCallback(async (id: string) => {
-    setDetailLoading(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const res = await fetch(`/api/leads/${id}`);
-      const data = (await res.json()) as {
-        lead?: Lead;
-        proposal?: Proposal | null;
-        error?: string;
-      };
-      if (!res.ok) throw new Error(data.error ?? "Failed to load lead");
-      setLead(data.lead ?? null);
-      const p = data.proposal ?? null;
-      setProposal(p);
-      setEditItems(p?.line_items ?? []);
-      setEditSummary(p?.ai_summary ?? "");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load lead");
-    } finally {
-      setDetailLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void loadLeads();
-  }, [loadLeads]);
+    let cancelled = false;
+
+    (async () => {
+      setListLoading(true);
+      try {
+        const next = await fetchLeadsList();
+        if (cancelled) return;
+        setLeads(next);
+        setSelectedId((current) => current ?? next[0]?.id ?? null);
+      } catch (err) {
+        if (!cancelled) {
+        }
+      } finally {
+        if (!cancelled) setListLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
-    if (selectedId) void loadDetail(selectedId);
-  }, [selectedId, loadDetail]);
+    if (!selectedId) return;
+    let cancelled = false;
+    (async () => {
+      setDetailLoading(true);
+      try {
+        let data: {
+          lead?: Lead;
+          proposal?: Proposal | null;
+          error?: string;
+          detail?: string;
+        } | null = null;
+        let ok = false;
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          if (cancelled) return;
+          const result = await apiFetch<{
+            lead?: Lead;
+            proposal?: Proposal | null;
+            error?: string;
+            detail?: string;
+          }>(`/api/leads/${selectedId}`);
+          data = result.data;
+          ok = result.res.ok;
+          if (ok) break;
+          if (attempt === 1) await new Promise((r) => setTimeout(r, 400));
+        }
+
+        if (cancelled || !data) return;
+        if (!ok) throw new Error(readErrorMessage(data, "Failed to load lead"));
+        setLead(data.lead ?? null);
+        const applied = applyProposal(data.proposal);
+        setProposal(applied.proposal);
+        setEditItems(applied.items);
+        setEditSummary(applied.summary);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setDetailLoading(false);
+      }
+    })();
+  }, [selectedId]);
+
+  async function generateForLead(leadId: string): Promise<Proposal> {
+    const data = await apiFetchOk<{
+      proposal?: Proposal;
+      error?: string;
+      detail?: string;
+    }>("/api/generate-proposal", "Generate failed", {
+      method: "POST",
+      body: JSON.stringify({ leadId }),
+    });
+    if (!data.proposal) throw new Error("No proposal returned");
+    return data.proposal;
+  }
+
+  async function handleCreateLead(
+    form: NewLeadForm,
+    options: { generate: boolean },
+  ) {
+    setCreatingLead(true);
+    try {
+      const data = await apiFetchOk<{
+        lead?: Lead;
+        error?: string;
+        detail?: string;
+      }>("/api/leads", "Failed to add lead", {
+        method: "POST",
+        body: JSON.stringify(form),
+      });
+      const newId = data.lead?.id;
+      if (!newId) throw new Error("Lead created but no id returned");
+
+      setAddLeadOpen(false);
+      await loadLeads(newId);
+
+      if (options.generate) {
+        setGenerating(true);
+        const next = await generateForLead(newId);
+        const applied = applyProposal(next);
+        setProposal(applied.proposal);
+        setEditItems(applied.items);
+        setEditSummary(applied.summary);
+        await loadLeads(newId);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setCreatingLead(false);
+    }
+  }
 
   async function handleGenerate() {
     if (!selectedId) return;
     setGenerating(true);
-    setError(null);
-    setNotice(null);
     try {
-      const res = await fetch("/api/generate-proposal", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ leadId: selectedId }),
-      });
-      const data = (await res.json()) as {
-        proposal?: Proposal;
-        error?: string;
-        detail?: string;
-      };
-      if (!res.ok) {
-        throw new Error(
-          data.detail ? `${data.error}: ${data.detail}` : data.error ?? "Generate failed",
-        );
-      }
-      setProposal(data.proposal ?? null);
-      setEditItems(data.proposal?.line_items ?? []);
-      setEditSummary(data.proposal?.ai_summary ?? "");
-      setNotice("Draft proposal generated.");
-      await loadLeads();
+      const next = await generateForLead(selectedId);
+      const applied = applyProposal(next);
+      setProposal(applied.proposal);
+      setEditItems(applied.items);
+      setEditSummary(applied.summary);
+      await loadLeads(selectedId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Generate failed");
+      console.error(err);
     } finally {
       setGenerating(false);
     }
   }
 
-  async function handleSaveEdits() {
-    if (!proposal || proposal.status !== "draft") return;
+  async function saveEdits(): Promise<boolean> {
+    if (!proposal || proposal.status !== "draft") return false;
     setSaving(true);
-    setError(null);
-    setNotice(null);
     try {
-      const { items, subtotal } = recalcItems(editItems);
-      const res = await fetch(`/api/proposals/${proposal.id}`, {
+      const { items, subtotal } = recomputeLineItems(editItems);
+      const data = await apiFetchOk<{
+        proposal?: Proposal;
+        error?: string;
+        detail?: string;
+      }>(`/api/proposals/${proposal.id}`, "Save failed", {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           line_items: items,
           ai_summary: editSummary,
         }),
       });
-      const data = (await res.json()) as {
-        proposal?: Proposal;
-        error?: string;
-      };
-      if (!res.ok) throw new Error(data.error ?? "Save failed");
-      setProposal(data.proposal ?? null);
-      setEditItems(data.proposal?.line_items ?? items);
-      setNotice(`Saved. Running total ${formatMoney(subtotal)}.`);
-      await loadLeads();
+      const applied = applyProposal(data.proposal);
+      setProposal(applied.proposal);
+      setEditItems(applied.items.length ? applied.items : items);
+      await loadLeads(selectedId ?? undefined);
+      return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Save failed");
+      console.error(err);
+      return false;
     } finally {
       setSaving(false);
     }
@@ -188,33 +267,25 @@ export function Dashboard() {
 
   async function handleApprove() {
     if (!proposal) return;
-    // Persist latest edits before approval so Slack total matches the UI.
+
     if (proposal.status === "draft") {
-      await handleSaveEdits();
+      const saved = await saveEdits();
+      if (!saved) return;
     }
+
     setApproving(true);
-    setError(null);
-    setNotice(null);
     try {
-      const res = await fetch(`/api/proposals/${proposal.id}/approve`, {
-        method: "POST",
-      });
-      const data = (await res.json()) as {
+      const { res, data } = await apiFetch<{
         proposal?: Proposal;
         error?: string;
         warning?: string;
         detail?: string;
-      };
+      }>(`/api/proposals/${proposal.id}/approve`, { method: "POST" });
       if (!res.ok) throw new Error(data.error ?? "Approve failed");
       setProposal(data.proposal ?? null);
-      if (data.warning) {
-        setNotice(`${data.warning}${data.detail ? `: ${data.detail}` : ""}`);
-      } else {
-        setNotice("Approved — Slack notified.");
-      }
-      await loadLeads();
+      await loadLeads(selectedId ?? undefined);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Approve failed");
+      console.error(err);
     } finally {
       setApproving(false);
     }
@@ -228,25 +299,24 @@ export function Dashboard() {
     setEditItems((prev) => {
       const next = [...prev];
       const item = { ...next[index] };
-      if (field === "description") {
-        item.description = value;
-      } else if (field === "quantity") {
-        item.quantity = Number(value) || 0;
-      } else {
-        item.unit_price = Number(value) || 0;
-      }
-      item.line_total =
-        Math.round(item.quantity * item.unit_price * 100) / 100;
+      if (field === "description") item.description = value;
+      else if (field === "quantity") item.quantity = Number(value) || 0;
+      else item.unit_price = Number(value) || 0;
+      item.line_total = roundMoney(item.quantity * item.unit_price);
       next[index] = item;
       return next;
     });
   }
 
-  const isDraft = proposal?.status === "draft";
-  const canEdit = Boolean(proposal && isDraft);
-
   return (
     <div className="flex min-h-svh flex-col bg-[#f6f4ef] text-stone-900">
+      <AddLeadModal
+        open={addLeadOpen}
+        submitting={creatingLead || generating}
+        onClose={() => setAddLeadOpen(false)}
+        onSubmit={handleCreateLead}
+      />
+
       <header className="border-b border-stone-200/80 bg-[#1f3d2b] px-6 py-5 text-white">
         <div className="mx-auto flex max-w-6xl items-end justify-between gap-4">
           <div>
@@ -257,35 +327,29 @@ export function Dashboard() {
               Greenscape Pro
             </h1>
             <p className="mt-1 text-sm text-emerald-100/80">
-              Proposal Generation Agent — notes in, priced draft out, you
-              approve.
+              Notes in → priced draft → you approve.
             </p>
           </div>
         </div>
       </header>
 
-      {(error || notice) && (
-        <div className="mx-auto w-full max-w-6xl px-6 pt-4">
-          {error && (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
-              {error}
-            </div>
-          )}
-          {notice && !error && (
-            <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-              {notice}
-            </div>
-          )}
-        </div>
-      )}
-
       <main className="mx-auto grid w-full max-w-6xl flex-1 gap-6 px-6 py-6 lg:grid-cols-[320px_1fr]">
         <section className="rounded-xl border border-stone-200 bg-white shadow-sm">
-          <div className="border-b border-stone-100 px-4 py-3">
-            <h2 className="text-sm font-semibold text-stone-800">Leads</h2>
-            <p className="text-xs text-stone-500">
-              Select a lead to generate or review a proposal.
-            </p>
+          <div className="flex items-start justify-between gap-2 border-b border-stone-100 px-4 py-3">
+            <div>
+              <h2 className="text-sm font-semibold text-stone-800">Leads</h2>
+              <p className="text-xs text-stone-500">
+                Select a lead or add a new one.
+              </p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setAddLeadOpen(true)}
+            >
+              + Add
+            </Button>
           </div>
           <div className="max-h-[70vh] overflow-y-auto">
             {listLoading ? (
@@ -293,9 +357,16 @@ export function Dashboard() {
                 Loading leads…
               </p>
             ) : leads.length === 0 ? (
-              <p className="px-4 py-8 text-center text-sm text-stone-500">
-                No leads yet. Run seed.sql in Neon.
-              </p>
+              <div className="px-4 py-8 text-center">
+                <p className="text-sm text-stone-500">No leads yet.</p>
+                <Button
+                  type="button"
+                  className="mt-3 bg-[#1f3d2b] text-white hover:bg-[#294f38]"
+                  onClick={() => setAddLeadOpen(true)}
+                >
+                  Add your first lead
+                </Button>
+              </div>
             ) : (
               <ul>
                 {leads.map((item) => (
@@ -319,7 +390,7 @@ export function Dashboard() {
                       </span>
                       {item.proposal_total != null && (
                         <span className="text-xs font-medium text-stone-700">
-                          {formatMoney(item.proposal_total)}
+                          {formatUsd(item.proposal_total)}
                         </span>
                       )}
                     </button>
@@ -331,9 +402,13 @@ export function Dashboard() {
         </section>
 
         <section className="rounded-xl border border-stone-200 bg-white shadow-sm">
-          {detailLoading || !lead ? (
+          {detailLoading ? (
             <p className="px-6 py-16 text-center text-sm text-stone-500">
-              {detailLoading ? "Loading lead…" : "Select a lead to begin."}
+              Loading lead…
+            </p>
+          ) : !lead ? (
+            <p className="px-6 py-16 text-center text-sm text-stone-500">
+              Select a lead to begin.
             </p>
           ) : (
             <div className="flex flex-col gap-6 p-6">
@@ -348,10 +423,10 @@ export function Dashboard() {
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <StatusBadge status={proposal?.status ?? lead.status} />
+                  <StatusBadge status={proposal?.status ?? "no proposal"} />
                   <Button
                     onClick={() => void handleGenerate()}
-                    disabled={generating}
+                    disabled={busy}
                     className="bg-[#1f3d2b] text-white hover:bg-[#294f38]"
                   >
                     {generating ? (
@@ -360,7 +435,7 @@ export function Dashboard() {
                         Generating…
                       </span>
                     ) : proposal ? (
-                      "Regenerate Proposal"
+                      "Regenerate"
                     ) : (
                       "Generate Proposal"
                     )}
@@ -380,21 +455,11 @@ export function Dashboard() {
               {proposal ? (
                 <div className="flex flex-col gap-4">
                   <div className="flex flex-wrap items-end justify-between gap-2">
-                    <div>
-                      <h3 className="text-sm font-semibold text-stone-800">
-                        Proposal draft
-                      </h3>
-                      <p className="text-xs text-stone-500">
-                        {proposal.model_used
-                          ? `Model: ${proposal.model_used}`
-                          : null}
-                        {proposal.cost_usd != null
-                          ? ` · Est. cost $${Number(proposal.cost_usd).toFixed(4)}`
-                          : null}
-                      </p>
-                    </div>
+                    <h3 className="text-sm font-semibold text-stone-800">
+                      Proposal draft
+                    </h3>
                     <p className="text-lg font-semibold text-stone-900">
-                      {formatMoney(canEdit ? runningTotal : proposal.total)}
+                      {formatUsd(canEdit ? runningTotal : proposal.total)}
                     </p>
                   </div>
 
@@ -426,7 +491,7 @@ export function Dashboard() {
                       <tbody>
                         {editItems.map((item, index) => (
                           <tr
-                            key={`${item.description}-${index}`}
+                            key={`${item.sku ?? item.description}-${index}`}
                             className="border-t border-stone-100"
                           >
                             <td className="px-3 py-2">
@@ -434,7 +499,11 @@ export function Dashboard() {
                                 value={item.description}
                                 disabled={!canEdit}
                                 onChange={(e) =>
-                                  updateItem(index, "description", e.target.value)
+                                  updateItem(
+                                    index,
+                                    "description",
+                                    e.target.value,
+                                  )
                                 }
                                 className="w-full min-w-[180px] rounded border border-transparent bg-transparent px-1 py-1 focus:border-stone-300 focus:bg-white disabled:text-stone-700"
                               />
@@ -458,13 +527,17 @@ export function Dashboard() {
                                 value={item.unit_price}
                                 disabled={!canEdit}
                                 onChange={(e) =>
-                                  updateItem(index, "unit_price", e.target.value)
+                                  updateItem(
+                                    index,
+                                    "unit_price",
+                                    e.target.value,
+                                  )
                                 }
                                 className="w-24 rounded border border-transparent bg-transparent px-1 py-1 focus:border-stone-300 focus:bg-white"
                               />
                             </td>
                             <td className="px-3 py-2 text-right font-medium tabular-nums">
-                              {formatMoney(item.line_total)}
+                              {formatUsd(item.line_total)}
                             </td>
                           </tr>
                         ))}
@@ -476,15 +549,15 @@ export function Dashboard() {
                     {canEdit && (
                       <Button
                         variant="outline"
-                        onClick={() => void handleSaveEdits()}
-                        disabled={saving || approving}
+                        onClick={() => void saveEdits()}
+                        disabled={busy}
                       >
                         {saving ? "Saving…" : "Save edits"}
                       </Button>
                     )}
                     <Button
                       onClick={() => void handleApprove()}
-                      disabled={approving || proposal.status === "approved"}
+                      disabled={busy || proposal.status === "approved"}
                       className="bg-emerald-700 text-white hover:bg-emerald-800"
                     >
                       {approving

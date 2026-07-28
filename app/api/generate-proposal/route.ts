@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiError, requireDatabaseUrl } from "@/lib/api";
 import { sql } from "@/lib/db";
 import { generateProposalFromNotes } from "@/lib/generate-proposal";
 
@@ -7,33 +8,19 @@ type GenerateBody = {
   rawNotes?: string;
 };
 
-/**
- * POST /api/generate-proposal
- * Body: { leadId: string } — loads notes from Neon, calls Claude, saves draft.
- * Optional rawNotes override for testing without a lead row.
- */
 export async function POST(request: Request) {
+  const db = requireDatabaseUrl();
+  if (db instanceof NextResponse) return db;
+
   let body: GenerateBody;
   try {
     body = (await request.json()) as GenerateBody;
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return apiError(400, "Invalid JSON body");
   }
 
   const leadId = body.leadId?.trim();
-  if (!leadId) {
-    return NextResponse.json(
-      { error: "leadId is required" },
-      { status: 400 },
-    );
-  }
-
-  if (!process.env.DATABASE_URL) {
-    return NextResponse.json(
-      { error: "DATABASE_URL is not configured" },
-      { status: 500 },
-    );
-  }
+  if (!leadId) return apiError(400, "leadId is required");
 
   let rawNotes = body.rawNotes?.trim() ?? "";
   let customerName = "Customer";
@@ -45,10 +32,7 @@ export async function POST(request: Request) {
       WHERE id = ${leadId}
       LIMIT 1
     `;
-
-    if (leads.length === 0) {
-      return NextResponse.json({ error: "Lead not found" }, { status: 404 });
-    }
+    if (leads.length === 0) return apiError(404, "Lead not found");
 
     const lead = leads[0] as {
       id: string;
@@ -56,96 +40,83 @@ export async function POST(request: Request) {
       raw_notes: string;
     };
     customerName = lead.customer_name;
-    if (!rawNotes) {
-      rawNotes = lead.raw_notes;
-    }
+    if (!rawNotes) rawNotes = lead.raw_notes;
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Database error";
-    console.error("[generate-proposal] lead fetch failed:", message);
-    return NextResponse.json(
-      { error: "Failed to load lead from database", detail: message },
-      { status: 500 },
-    );
+    return apiError(500, "Failed to load lead from database", err);
   }
 
   if (!rawNotes) {
-    return NextResponse.json(
-      { error: "Lead has no site-walk notes to price" },
-      { status: 400 },
-    );
+    return apiError(400, "Lead has no site-walk notes to price");
   }
 
   let generated;
   try {
     generated = await generateProposalFromNotes(rawNotes);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Claude API error";
-    console.error("[generate-proposal] Claude failed:", message);
-    return NextResponse.json(
-      {
-        error:
-          "Proposal generation failed after validation/retry. No draft was saved.",
-        detail: message,
-      },
-      { status: 502 },
+    return apiError(
+      502,
+      "Proposal generation failed after validation/retry. No draft was saved.",
+      err,
     );
   }
 
   const { draft, model_used, cost_usd } = generated;
 
   try {
-    // Guardrails already validated shape — only then persist as draft.
-    const inserted = await sql`
-      INSERT INTO proposals (
-        lead_id,
-        line_items,
-        subtotal,
-        total,
-        ai_summary,
-        status,
-        model_used,
-        cost_usd
-      )
-      VALUES (
-        ${leadId},
-        ${JSON.stringify(draft.line_items)},
-        ${draft.subtotal},
-        ${draft.total},
-        ${draft.summary},
-        'draft',
-        ${model_used},
-        ${cost_usd}
-      )
-      RETURNING
-        id,
-        lead_id,
-        line_items,
-        subtotal,
-        total,
-        ai_summary,
-        status,
-        model_used,
-        cost_usd,
-        created_at
+    const existing = await sql`
+      SELECT id FROM proposals
+      WHERE lead_id = ${leadId} AND status = 'draft'
+      ORDER BY created_at DESC
+      LIMIT 1
     `;
 
-    // Mark lead as having a draft so the dashboard can badge it.
+    let proposal;
+    if (existing.length > 0) {
+      const draftId = (existing[0] as { id: string }).id;
+      const updated = await sql`
+        UPDATE proposals
+        SET
+          line_items = ${JSON.stringify(draft.line_items)},
+          subtotal = ${draft.subtotal},
+          total = ${draft.total},
+          ai_summary = ${draft.summary},
+          model_used = ${model_used},
+          cost_usd = ${cost_usd}
+        WHERE id = ${draftId}
+        RETURNING
+          id, lead_id, line_items, subtotal, total, ai_summary,
+          status, model_used, cost_usd, created_at
+      `;
+      proposal = updated[0];
+    } else {
+      const inserted = await sql`
+        INSERT INTO proposals (
+          lead_id, line_items, subtotal, total, ai_summary,
+          status, model_used, cost_usd
+        )
+        VALUES (
+          ${leadId},
+          ${JSON.stringify(draft.line_items)},
+          ${draft.subtotal},
+          ${draft.total},
+          ${draft.summary},
+          'draft',
+          ${model_used},
+          ${cost_usd}
+        )
+        RETURNING
+          id, lead_id, line_items, subtotal, total, ai_summary,
+          status, model_used, cost_usd, created_at
+      `;
+      proposal = inserted[0];
+    }
+
     await sql`
-      UPDATE leads
-      SET status = 'proposal_draft'
-      WHERE id = ${leadId}
+      UPDATE leads SET status = 'proposal_draft' WHERE id = ${leadId}
     `;
 
-    return NextResponse.json({
-      proposal: inserted[0],
-      customer_name: customerName,
-    });
+    return NextResponse.json({ proposal, customer_name: customerName });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Database error";
-    console.error("[generate-proposal] save failed:", message);
-    return NextResponse.json(
-      { error: "Generated OK but failed to save draft", detail: message },
-      { status: 500 },
-    );
+    return apiError(500, "Generated OK but failed to save draft", err);
   }
 }

@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
+import { apiError, requireDatabaseUrl } from "@/lib/api";
 import { sql } from "@/lib/db";
-import type { LineItem } from "@/lib/types";
+import { recomputeLineItems } from "@/lib/money";
+import { isFiniteNumber, type LineItem } from "@/lib/types";
 
 type RouteContext = { params: { id: string } };
 
@@ -9,47 +11,28 @@ type PatchBody = {
   ai_summary?: string;
 };
 
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-/** PATCH /api/proposals/[id] — founder edits line items / summary before approve. */
 export async function PATCH(request: Request, context: RouteContext) {
-  const proposalId = context.params.id;
-
-  if (!process.env.DATABASE_URL) {
-    return NextResponse.json(
-      { error: "DATABASE_URL is not configured" },
-      { status: 500 },
-    );
-  }
+  const db = requireDatabaseUrl();
+  if (db instanceof NextResponse) return db;
 
   let body: PatchBody;
   try {
     body = (await request.json()) as PatchBody;
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return apiError(400, "Invalid JSON body");
   }
 
   if (!body.line_items && body.ai_summary === undefined) {
-    return NextResponse.json(
-      { error: "Provide line_items and/or ai_summary" },
-      { status: 400 },
-    );
+    return apiError(400, "Provide line_items and/or ai_summary");
   }
 
   try {
     const existing = await sql`
-      SELECT id, status FROM proposals WHERE id = ${proposalId} LIMIT 1
+      SELECT id, status FROM proposals WHERE id = ${context.params.id} LIMIT 1
     `;
-    if (existing.length === 0) {
-      return NextResponse.json({ error: "Proposal not found" }, { status: 404 });
-    }
+    if (existing.length === 0) return apiError(404, "Proposal not found");
     if ((existing[0] as { status: string }).status !== "draft") {
-      return NextResponse.json(
-        { error: "Only draft proposals can be edited" },
-        { status: 409 },
-      );
+      return apiError(409, "Only draft proposals can be edited");
     }
 
     let lineItemsJson: string | null = null;
@@ -58,44 +41,28 @@ export async function PATCH(request: Request, context: RouteContext) {
 
     if (body.line_items) {
       if (!Array.isArray(body.line_items) || body.line_items.length === 0) {
-        return NextResponse.json(
-          { error: "line_items must be a non-empty array" },
-          { status: 400 },
-        );
+        return apiError(400, "line_items must be a non-empty array");
       }
 
-      const normalized: LineItem[] = [];
       for (const item of body.line_items) {
         if (
           typeof item.description !== "string" ||
           !isFiniteNumber(item.quantity) ||
           !isFiniteNumber(item.unit_price)
         ) {
-          return NextResponse.json(
-            { error: "Invalid line item shape" },
-            { status: 400 },
-          );
+          return apiError(400, "Invalid line item shape");
         }
-        const line_total =
-          Math.round(item.quantity * item.unit_price * 100) / 100;
-        normalized.push({
-          sku: item.sku,
-          description: item.description,
-          quantity: item.quantity,
-          unit_price: item.unit_price,
-          line_total,
-        });
       }
 
-      subtotal =
-        Math.round(normalized.reduce((s, i) => s + i.line_total, 0) * 100) /
-        100;
-      total = subtotal;
-      lineItemsJson = JSON.stringify(normalized);
+      const { items, subtotal: nextSubtotal } = recomputeLineItems(
+        body.line_items,
+      );
+      lineItemsJson = JSON.stringify(items);
+      subtotal = nextSubtotal;
+      total = nextSubtotal;
     }
 
-    const summary =
-      body.ai_summary !== undefined ? body.ai_summary : null;
+    const summary = body.ai_summary !== undefined ? body.ai_summary : null;
 
     const updated = await sql`
       UPDATE proposals
@@ -104,27 +71,14 @@ export async function PATCH(request: Request, context: RouteContext) {
         subtotal = COALESCE(${subtotal}, subtotal),
         total = COALESCE(${total}, total),
         ai_summary = COALESCE(${summary}, ai_summary)
-      WHERE id = ${proposalId}
+      WHERE id = ${context.params.id}
       RETURNING
-        id,
-        lead_id,
-        line_items,
-        subtotal,
-        total,
-        ai_summary,
-        status,
-        model_used,
-        cost_usd,
-        created_at
+        id, lead_id, line_items, subtotal, total, ai_summary,
+        status, model_used, cost_usd, created_at
     `;
 
     return NextResponse.json({ proposal: updated[0] });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Database error";
-    console.error("[PATCH /api/proposals/:id]", message);
-    return NextResponse.json(
-      { error: "Failed to update proposal", detail: message },
-      { status: 500 },
-    );
+    return apiError(500, "Failed to update proposal", err);
   }
 }
